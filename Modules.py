@@ -22,8 +22,8 @@ from Utils import (
     binarize_line,
 )
 
-from KerasModels import Easter2
-from keras.models import Model
+#from KerasModels import Easter2
+#from keras.models import Model
 
 
 class PatchedLineDetection:

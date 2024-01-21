@@ -1,13 +1,48 @@
 import os
 import cv2
 import math
+import logging
 import tensorflow as tf
 import numpy as np
-
+import statistics
 from datetime import datetime
 from xml.dom import minidom
 from scipy.signal import find_peaks
 import xml.etree.ElementTree as etree
+
+
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Bbox:
+    x: int
+    y: int
+    w: int
+    h: int
+
+@dataclass
+class LineData:
+    contour: list
+    bbox: Bbox
+    center: tuple[int, int]
+
+@dataclass
+class PerigPrediction:
+    images: np.array
+    lines: np.array
+    captions: np.array
+    margins: np.array
+
+@dataclass
+class LayoutData:
+    images: list[Bbox]
+    text_bboxes: list[Bbox]
+    lines: list[LineData]
+    captions: list[Bbox]
+    margins: list[Bbox]
+    predictions: dict
 
 
 def get_file_name(x) -> str:
@@ -71,7 +106,7 @@ def resize_image(
 
 
 def pad_image(
-    img: np.array, patch_size: int = 64, is_mask=False
+    img: np.array, patch_size: int = 64, is_mask=False, pad_value: int = 255
 ) -> tuple[np.array, tuple[float, float]]:
     x_pad = (math.ceil(img.shape[1] / patch_size) * patch_size) - img.shape[1]
     y_pad = (math.ceil(img.shape[0] / patch_size) * patch_size) - img.shape[0]
@@ -82,8 +117,8 @@ def pad_image(
     else:
         pad_y = np.ones(shape=(y_pad, img.shape[1], 3), dtype=np.uint8)
         pad_x = np.ones(shape=(img.shape[0] + y_pad, x_pad, 3), dtype=np.uint8)
-        pad_y *= 255
-        pad_x *= 255
+        pad_y *= pad_value
+        pad_x *= pad_value
 
     img = np.vstack((img, pad_y))
     img = np.hstack((img, pad_x))
@@ -181,6 +216,12 @@ def pad_image2(
         out_img, (target_width, target_height), interpolation=cv2.INTER_LINEAR
     )
 
+def prepare_img_patches(image: np.array) -> np.array:
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    image = image.astype(np.float32)
+    image /= 255.0
+    image = np.dstack([image, image, image])
+    return image
 
 def patch_image(
     img: np.array, patch_size: int = 64, overlap: int = 2, is_mask=False
@@ -285,6 +326,64 @@ def rotate_page(
     )
 
     return rotated_img, rotated_prediction, mean_angle
+
+
+def rotate_from_hough(image: np.array) -> tuple[np.array, float]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=0.2, tileGridSize=(8,8))
+    cl_img = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(cl_img, (13, 13), 0)
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 19, 11)
+
+    lines = cv2.HoughLinesP(
+        thresh,
+        1,
+        np.pi / 180,
+        threshold=130,
+        minLineLength=40,
+        maxLineGap=8
+    )
+
+    if lines is None or len(lines) == 0:
+        logging.warning(f"No lines found in image, skipping...")
+
+        return image, 0
+    
+    prev_img = image.copy()
+    angles = []
+    zero_angles = []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = math.atan2(y2-y1, x2-x1) * 180 / np.pi
+
+        if abs(angle) < 5 and abs(angle) > 0:
+            angles.append(angle)
+
+        elif int(angle) == 0:
+            zero_angles.append(angle)
+
+        cv2.line(prev_img, (x1, y1), (x2, y2), (100, 100, 0), 3)
+
+    if len(angles) != 0:     
+        avg_angle = statistics.median(angles)
+        ratio = (len(zero_angles) / len(angles))
+
+        if ratio < 0.5:
+            rot_angle = avg_angle
+        elif ratio > 0.5 and ratio < 0.9:
+            rot_angle = avg_angle / 2
+        else:
+            rot_angle = 0.0
+    else:
+        logging.warning("No angle data found in image.")
+        rot_angle = 0
+
+    rows, cols = image.shape[:2]
+    rot_matrix = cv2.getRotationMatrix2D((cols / 2, rows / 2), (rot_angle), 1)
+    rotated_img = cv2.warpAffine(image, rot_matrix, (cols, rows), borderValue=(0, 0, 0))
+
+    return rotated_img, rot_angle
 
 
 def get_line_images(
