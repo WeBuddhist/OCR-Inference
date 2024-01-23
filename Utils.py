@@ -9,40 +9,8 @@ from datetime import datetime
 from xml.dom import minidom
 from scipy.signal import find_peaks
 import xml.etree.ElementTree as etree
+from DataClasses import Bbox, LineData, LayoutData
 
-
-
-from dataclasses import dataclass
-
-
-@dataclass
-class Bbox:
-    x: int
-    y: int
-    w: int
-    h: int
-
-@dataclass
-class LineData:
-    contour: list
-    bbox: Bbox
-    center: tuple[int, int]
-
-@dataclass
-class PerigPrediction:
-    images: np.array
-    lines: np.array
-    captions: np.array
-    margins: np.array
-
-@dataclass
-class LayoutData:
-    images: list[Bbox]
-    text_bboxes: list[Bbox]
-    lines: list[LineData]
-    captions: list[Bbox]
-    margins: list[Bbox]
-    predictions: dict
 
 
 def get_file_name(x) -> str:
@@ -105,9 +73,9 @@ def resize_image(
     return resized_img, resize_factor
 
 
-def pad_image(
-    img: np.array, patch_size: int = 64, is_mask=False, pad_value: int = 255
-) -> tuple[np.array, tuple[float, float]]:
+def pad_image(img: np.array, patch_size: int = 64, 
+              is_mask=False, pad_value: int = 255) -> tuple[np.array, tuple[int, int]]:
+    
     x_pad = (math.ceil(img.shape[1] / patch_size) * patch_size) - img.shape[1]
     y_pad = (math.ceil(img.shape[0] / patch_size) * patch_size) - img.shape[0]
 
@@ -466,6 +434,180 @@ def get_line_images(
 
     return line_images
 
+def get_line_images_from_line_data(
+    image: np.array,
+    line_data: list[LineData],
+    dilate_kernel: int = 24,
+    binarize: bool = False,
+):
+    line_images = []
+
+    # enforce a default value in case the somebody passes 0 as value
+    if dilate_kernel == 0:
+        dilate_kernel = 24
+
+    dilate_iterations = 1
+
+    for line in line_data:
+        image_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+        cv2.drawContours(
+            image_mask, [line.contour], contourIdx=0, color=(255, 255, 255), thickness=-1
+        )
+
+        bbox_height = line.bbox.h
+
+        if bbox_height <= 30:
+            dilate_iterations = dilate_kernel // 2
+        elif bbox_height > 30 and bbox_height < 50:
+            dilate_iterations = dilate_kernel * 1
+        elif bbox_height >= 50 and bbox_height < 90:
+            dilate_iterations = dilate_kernel * 2
+        elif bbox_height > 90:
+            dilate_iterations = (
+                dilate_kernel * 6
+            )  # maybe go with 4-5? kernel sizes can go up to 126
+        else:
+            print(
+                f"Fallback on kernel calculation, height: {bbox_height}: dilate_kernel = {dilate_kernel}, iterations: {dilate_iterations}"
+            )
+        # print(f"BBox Height: {height} => dilate iterations: {dilate_iterations}")
+
+        dilated1 = cv2.dilate(
+            image_mask,
+            kernel=(dilate_kernel, dilate_kernel),
+            iterations=dilate_iterations,
+            borderValue=0,
+            anchor=(-1, 0),
+            borderType=cv2.BORDER_DEFAULT,
+        )
+        dilated2 = cv2.dilate(
+            image_mask,
+            kernel=(dilate_kernel, dilate_kernel),
+            iterations=dilate_iterations,
+            borderValue=0,
+            anchor=(0, 1),
+            borderType=cv2.BORDER_DEFAULT,
+        )
+        combined = cv2.add(dilated1, dilated2)
+        image_masked = cv2.bitwise_and(image, image, mask=combined)
+
+        cropped_img = np.delete(
+            image_masked, np.where(~image_masked.any(axis=1))[0], axis=0
+        )
+        cropped_img = np.delete(
+            cropped_img, np.where(~cropped_img.any(axis=0))[0], axis=1
+        )
+
+        # print(cropped_img.shape)
+
+        if binarize:
+            # indices = np.where(cropped_img[:, :, 1] == 0)
+            # clear = cropped_img.copy()
+            # clear[indices[0], indices[1], :] = [255, 255, 255]
+            # clear_bw = cv2.cvtColor(clear, cv2.COLOR_BGR2GRAY)
+            # _, thresh = cv2.threshold(clear_bw, 170, 255, cv2.THRESH_BINARY)
+            # line_images.append(thresh)
+            cropped_img = binarize_line(cropped_img)
+            line_images.append(cropped_img)
+        else:
+            line_images.append(cropped_img)
+
+    return line_images
+
+
+def group_bbox_centers(bbox_centers: list[tuple[int, int]], line_threshold: int = 20):
+  
+  sorted_bbox_centers = []
+  tmp_line = []
+
+  for i in range(0, len(bbox_centers)):    
+      if len(tmp_line) > 0:
+        for s in range(0, len(tmp_line)):
+          y_diff = abs(tmp_line[s][1] - bbox_centers[i][1])
+
+          if y_diff > line_threshold:
+            tmp_line.sort(key=lambda x:x[0])
+            sorted_bbox_centers.append(tmp_line.copy())
+            tmp_line.clear()
+
+            tmp_line.append(bbox_centers[i])
+            break
+          else:
+            tmp_line.append(bbox_centers[i])
+            break
+      else:
+        tmp_line.append(bbox_centers[i])
+
+  sorted_bbox_centers.append(tmp_line)
+
+  for y in sorted_bbox_centers:
+    y.sort(key=lambda x:x[0])
+
+  sorted_bbox_centers = list(reversed(sorted_bbox_centers))
+
+  return sorted_bbox_centers
+
+
+def get_line_treshold(line_prediction: np.array, slice_width: int = 20, steps: int = 8):
+    """
+    This function generates n slices (of n = steps) width the width of slice_width across the bbox of the detected lines.
+    The slice with the max. number of contained contours is taken to be the canditate to calculate the bbox center of each contour and
+    take the median distance between each bbox center as estimated line cut-off threshold to sort each line segment across the horizontal
+
+    Note: This approach might turn out to be problematic in case of sparsely spread line segments across a page
+    """
+    
+    slice_width = 20
+    steps = 8
+    x, y, w, h = cv2.boundingRect(line_prediction)
+    bbox_width = w - x
+    x_steps = (bbox_width // steps) - 1 - slice_width
+
+    bbox_numbers = []
+
+    for step in range(1, steps+1):
+        x_offset = x_steps * step
+        x_start = x+x_offset
+        x_end = x_start+slice_width
+        #print(f"{x_start}:{x_end}")
+
+        slice = line_prediction[y:y+h, x_start:x_end]
+        contours, _ = cv2.findContours(
+                    slice, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+                )
+        #bbox = cv2.boundingRect(contour)
+        bbox_numbers.append((len(contours), contours))
+
+    sorted_list = sorted(bbox_numbers, key = lambda x : x[0], reverse=True)
+    reference_slice = sorted_list[0]
+
+    y_points = []
+    n_contours, contours = reference_slice
+
+    for _, contour in enumerate(contours):
+        x, y, w, h  = cv2.boundingRect(contour)
+        #x_center = x + (w // 2)
+        y_center = y + (h // 2)
+        y_points.append(y_center)
+        
+    
+    line_threshold = np.median(y_points) // n_contours
+    #print(f"line_treshold: {line_threshold}")
+
+    return line_threshold
+
+def get_line_bbox_centers(layout_data: LayoutData) -> list[tuple[int, int]]:
+    centers = []
+
+    for line in layout_data.lines:
+        x_center = line.bbox.x + (line.bbox.w // 2)
+        y_center = line.bbox.y + (line.bbox.h // 2)
+       
+        centers.append((x_center, y_center))
+
+    return centers
+
+
 
 def get_lines(image: np.array, prediction: np.array, line_kernel: int, binarize: bool):
     line_contours, _ = cv2.findContours(
@@ -571,6 +713,52 @@ def sort_lines(line_prediction: np.array, contours: tuple):
     return sorted_contour_dict, peaks
 
 
+def group_line_chunks(sorted_bbox_centers, layout_data: LayoutData, debug: bool = False):
+    new_line_data = []
+    for bbox_centers in sorted_bbox_centers:
+
+      if len(bbox_centers) > 1: # i.e. more than 1 bbox center in a group
+          contour_stack = []
+          
+          for box_center in bbox_centers:
+            for line_data in layout_data.lines:
+              if box_center == line_data.center:
+                  #print("Found yah! Chunk ;)")
+                  contour_stack.append(line_data.contour)
+                  break
+        
+          stacked_contour = np.vstack(contour_stack)
+          stacked_contour = cv2.convexHull(stacked_contour)
+          x, y, w, h = cv2.boundingRect(stacked_contour)
+          _bbox = Bbox(x, y, w, h)
+          x_center = _bbox.x + (_bbox.w // 2)
+          y_center = _bbox.y + (_bbox.h // 2)
+
+          new_line = LineData(
+             contour=stacked_contour,
+             bbox=_bbox,
+             center = (x_center, y_center))
+          
+          new_line_data.append(new_line)
+         
+
+      else:
+        for _bcenter in bbox_centers:
+            for line_data in layout_data.lines:
+              if _bcenter == line_data.center:      
+                new_line_data.append(line_data)
+                break
+        """
+        for line_data in layout_data.lines:
+              if line_data.center == line_data.center:
+                 print(line_data.center)
+                 new_line_data.append(line_data)
+                 break
+        """       
+    return new_line_data
+
+
+
 def generate_line_images(
     image: np.array, prediction: np.array, line_kernel: int, binarize: bool
 ):
@@ -663,6 +851,7 @@ def prepare_ocr_image(
 def prepare_tf_ocr_image(image: np.array, target_height: int = 80, target_width: int = 2000):
     tf_img = tf.image.resize_with_pad(image, target_height, target_width)
     tf_img = tf_img / 255.0
+    
     tf_img = tf.transpose(tf_img, perm=[1, 0, 2])
     tf_img = tf.squeeze(tf_img)
 

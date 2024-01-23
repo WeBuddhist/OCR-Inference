@@ -1,14 +1,17 @@
 import os
 import cv2
+import logging
 import json
 import shutil
 import requests
 import numpy as np
+import onnxruntime as ort
+
 from tqdm import tqdm
 from pathlib import Path
-import onnxruntime as ort
 from scipy.special import expit
 from scipy.signal import find_peaks
+from scipy.special import softmax
 from fast_ctc_decode import viterbi_search
 from Utils import (
     pad_image,
@@ -18,12 +21,302 @@ from Utils import (
     unpatch_prediction,
     generate_line_images,
     prepare_ocr_image,
+    prepare_img_patches,
     prepare_tf_ocr_image,
     binarize_line,
+    resize_to_width,
+    rotate_from_hough,
+    get_line_bbox_centers,
+    get_line_treshold,
+    group_bbox_centers,
+    group_line_chunks,
 )
+from Config import COLOR_DICT
+from DataClasses import Bbox, LineData, LayoutData
 
-#from KerasModels import Easter2
-#from keras.models import Model
+# from KerasModels import Easter2
+# from keras.models import Model
+
+
+class PatchedPerigLayoutDetection:
+    """
+    Layout Detection specifically optimized for the traditional 'long' Tibetan book format 'perig'.
+    The inference runs on the provided onnx model file.
+    """
+
+    def __init__(self, config_file: str) -> None:
+        self.config_file = config_file
+        self.patch_size = 512
+        self.execution_providers = ["CPUExecutionProvider", "CUDAExecutionProvider"]
+        self.layout_inference = None
+        self.class_dict = {}
+
+        self._can_run = False
+        self.current_layout_data = None
+
+        self.init(self.config_file)
+
+    def init(self, config_file: str):
+        if not os.path.isfile(config_file):
+            logging.error(f"{config_file} does not exist, exiting.")
+        else:
+            try:
+                model_dir = os.path.dirname(config_file)
+                _file = open(config_file)
+                json_content = json.loads(_file.read())
+                self.patch_size = int(json_content["input_width"])
+                onnx_model_file = json_content["model"]
+                self.class_dict = json_content["classes"]
+                model_file_path = f"{model_dir}/{onnx_model_file}"
+                self.layout_inference = ort.InferenceSession(
+                    model_file_path, providers=self.execution_providers
+                )
+
+                logging.info(f"Loaded model from: {onnx_model_file}")
+                self._can_run = True
+
+            except BaseException as e:
+                logging.error(f"Failed to initialize Layout Detection: {e}")
+
+    def predict_image(self, image: np.array):
+        padded_img, (pad_x, pad_y) = pad_image(image, self.patch_size, pad_value=0)
+        img_patches, y_steps = patch_image(padded_img, patch_size=self.patch_size)
+
+        img_batch = [prepare_img_patches(x) for x in img_patches]
+        img_batch = np.array(img_batch)
+        img_batch = np.transpose(img_batch, axes=[0, 3, 1, 2])
+        img_batch = ort.OrtValue.ortvalue_from_numpy(img_batch)
+        pred_batch = self.layout_inference.run(None, {"input": img_batch})
+        pred_batch = pred_batch[0]
+        pred_batch = np.transpose(pred_batch, axes=[0, 2, 3, 1])
+        pred_batch = softmax(pred_batch, axis=-1)
+
+        unpatched_predition = unpatch_prediction(pred_batch, y_splits=y_steps)
+        unpatched_predition = unpatched_predition[
+            : unpatched_predition.shape[0] - pad_y,
+            : unpatched_predition.shape[1] - pad_x,
+        ]
+        back_sized_image = cv2.resize(
+            unpatched_predition, (image.shape[1], image.shape[0])
+        )
+
+        combined_output = np.argmax(back_sized_image, axis=-1)
+        combined_output = combined_output.astype(np.uint8)
+        combined_output = np.expand_dims(combined_output, axis=-1)
+
+        return back_sized_image, combined_output
+
+    def generate_page_data(
+        self, predictions: np.array, area_threshold: int = 20
+    ) -> np.array:
+        # TODO: move the calculation of the text bounding box after the filtering of the lines so that small outlier contours don't extend the box too much
+        # TODO: add filtering for the other classes
+        # TODO: maybe use cv2.minAreaRect instead of bounding rect?
+
+        pred_images = predictions[:, :, 1]
+        pred_lines = predictions[:, :, 2]
+        pred_margin = predictions[:, :, 3]
+        pred_caption = predictions[:, :, 4]
+
+        pred_images = np.where(pred_images > 200, 255, 0)
+        pred_lines = np.where(pred_lines > 200, 255, 0)
+        pred_margin = np.where(pred_margin > 200, 255, 0)
+        pred_caption = np.where(pred_caption > 200, 255, 0)
+
+        pred_images = pred_images.astype(np.uint8)
+        pred_lines = pred_lines.astype(np.uint8)
+        pred_margin = pred_margin.astype(np.uint8)
+        pred_caption = pred_caption.astype(np.uint8)
+
+        images = []
+        text_bboxes = []
+        lines = []
+        captions = []
+        margins = []
+
+        prediction_images = {}
+
+        if np.sum(pred_lines) > 0:
+            x, y, w, h = cv2.boundingRect(np.array(pred_lines))
+            bbox = Bbox(x, y, w, h)
+            text_bboxes.append(bbox)
+
+            contours, _ = cv2.findContours(
+                pred_lines, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            """for contour in contours:
+                min_rect = cv2.minAreaRect(contour[0])
+                box = cv2.boxPoints(min_rect)
+                box = np.intp(box)
+                lines.append(box)
+            """
+            filtered_contours = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+
+                if area > area_threshold:
+                    filtered_contours.append(contour)
+
+            for _, contour in enumerate(filtered_contours):
+                x, y, w, h = cv2.boundingRect(contour)
+                x_center = x + (w // 2)
+                y_center = y + (h // 2)
+
+                line_data = LineData(
+                    contour=contour, bbox=Bbox(x, y, w, h), center=(x_center, y_center)
+                )
+
+                lines.append(line_data)
+
+            prediction_images["lines"] = pred_lines
+        else:
+            prediction_images["lines"] = None
+
+        if np.sum(pred_images) > 0:
+            contours, _ = cv2.findContours(
+                pred_images, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                bbox = Bbox(x, y, w, h)
+                images.append(bbox)
+
+            prediction_images["images"] = pred_lines
+        else:
+            prediction_images["images"] = None
+
+        if np.sum(pred_margin) > 0:
+            contours, _ = cv2.findContours(
+                pred_margin, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                bbox = Bbox(x, y, w, h)
+                margins.append(bbox)
+
+            prediction_images["margins"] = pred_margin
+        else:
+            prediction_images["margins"] = None
+
+        if np.sum(pred_caption) > 0:
+            contours, _ = cv2.findContours(
+                pred_caption, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                bbox = Bbox(x, y, w, h)
+                captions.append(bbox)
+
+            prediction_images["captions"] = pred_caption
+        else:
+            prediction_images["captions"] = None
+
+        layout_data = LayoutData(
+            images, text_bboxes, lines, captions, margins, predictions=prediction_images
+        )
+
+        return layout_data
+
+    def generate_preview(
+        self, image: np.array, layout_data: LayoutData, alpha: float = 0.4
+    ) -> np.array:
+        preview_image = image.copy()
+        preview_mask = np.zeros(image.shape, dtype=np.uint8)
+
+        if len(layout_data.lines) > 0:
+            color = tuple([int(x) for x in COLOR_DICT["line"].split(",")])
+
+            for line_data in layout_data.lines:
+                cv2.drawContours(
+                    preview_mask,
+                    [line_data.contour],
+                    contourIdx=-1,
+                    color=color,
+                    thickness=-1,
+                )
+
+        if len(layout_data.images) > 0:
+            color = tuple([int(x) for x in COLOR_DICT["image"].split(",")])
+
+            for bbox in layout_data.images:
+                cv2.rectangle(
+                    preview_mask,
+                    (bbox.x, bbox.y),
+                    (bbox.x + bbox.w, bbox.y + bbox.h),
+                    color,
+                    2,
+                )
+
+        if len(layout_data.captions) > 0:
+            color = tuple([int(x) for x in COLOR_DICT["caption"].split(",")])
+
+            for bbox in layout_data.captions:
+                cv2.rectangle(
+                    preview_mask,
+                    (bbox.x, bbox.y),
+                    (bbox.x + bbox.w, bbox.y + bbox.h),
+                    color,
+                    2,
+                )
+
+        if len(layout_data.margins) > 0:
+            color = tuple([int(x) for x in COLOR_DICT["margin"].split(",")])
+
+            for bbox in layout_data.margins:
+                cv2.rectangle(
+                    preview_mask,
+                    (bbox.x, bbox.y),
+                    (bbox.x + bbox.w, bbox.y + bbox.h),
+                    color,
+                    2,
+                )
+
+        cv2.addWeighted(preview_mask, alpha, preview_image, 1 - alpha, 0, preview_image)
+
+        return preview_image
+
+    def sort_lines(self, layout_data: LayoutData):
+        if len(layout_data.lines) > 0:
+            bbox_centers = get_line_bbox_centers(layout_data)
+            line_treshold = get_line_treshold(layout_data.predictions["lines"])
+            sorted_bbox_centers = group_bbox_centers(
+                bbox_centers, line_threshold=line_treshold
+            )
+            new_lines = group_line_chunks(sorted_bbox_centers, layout_data)
+            layout_data.lines = new_lines
+            self.current_layout_data = layout_data
+            return layout_data
+        else:
+            logging.warning(
+                f"Provided layout data does not contain any lines, skipping."
+            )
+
+        return layout_data
+
+    def predict(
+        self, image: np.array, sort_lines: bool = True, return_preview: bool = False
+    ):
+        p_img = resize_to_width(image, target_width=2048)
+
+        p_img = cv2.cvtColor(p_img, cv2.COLOR_BGR2RGB)
+        p_img, angle = rotate_from_hough(p_img)
+
+        _prediction, class_image = self.predict_image(p_img)
+        _prediction = cv2.resize(_prediction, (image.shape[1], image.shape[0]))
+        class_image = cv2.resize(class_image, (image.shape[1], image.shape[0]))
+        p_img = cv2.resize(p_img, (image.shape[1], image.shape[0]))
+
+        _prediction = _prediction.astype(np.uint8)
+        layout_data = self.generate_page_data(_prediction, area_threshold=20)
+        self.current_layout_data = layout_data
+
+        preview_img = self.generate_preview(p_img, layout_data)
+
+        return layout_data, preview_img
 
 
 class PatchedLineDetection:
@@ -131,10 +424,17 @@ class PatchedLineDetection:
         back_sized_image = back_sized_image.astype(np.uint8)
 
         # TODO: remove this into a post-processing module
-        rotated_image, line_images, sorted_contours, bbox, peaks = generate_line_images(
+        (
+            rotated_img,
+            line_images,
+            sorted_contours,
+            bbox,
+            peaks,
+            angle,
+        ) = generate_line_images(
             original_image, back_sized_image, line_kernel, self._binarize_output
         )
-        return back_sized_image, rotated_image, line_images, sorted_contours, bbox, peaks
+        return back_sized_image, rotated_img, line_images, sorted_contours, bbox, peaks
 
 
 class OCRInference:
@@ -195,19 +495,18 @@ class OCRInference:
 
         if self._swap_hw:
             img_batch = np.transpose(img_batch, axes=[0, 2, 1])
-        
 
         ort_batch = ort.OrtValue.ortvalue_from_numpy(img_batch)
         ocr_results = self.ocr_session.run_with_ort_values(
             [self._output_layer], {self._input_layer: ort_batch}
         )
         prediction = ocr_results[0].numpy()
-        #print(f"Prediction: {prediction.shape}")
-        
+        # print(f"Prediction: {prediction.shape}")
+
         # this is a little unclear, it basically takes into account, the different
         # ordering of the channels for CRNN and EASTER models. Maybe rename this variable or make this process
         # more explicit
-        
+
         if not self._swap_hw:
             prediction = np.transpose(prediction, axes=[1, 0, 2])
 
@@ -225,6 +524,112 @@ class OCRInference:
         return predicted_text, prediction
 
 
+import json
+import pyewts
+import tensorflow as tf
+from keras.models import Model
+from KerasModels import Easter2, Easter2b
+import keras.backend as K
+from Utils import prepare_tf_ocr_image
+
+
+class KerasInference:
+    def __init__(self, config_file) -> None:
+        self.config_file = config_file
+        self._input_width = 2000
+        self._input_height = 80
+        self._time_steps = 500
+        self._characters = []
+        self._model = None
+        self._converter = pyewts.pyewts()
+
+        self._init()
+
+    def get_model_characters(self, characters: str) -> list[str]:
+        characters = [c for c in characters]
+        characters.append("[BLK]")
+        characters.insert(0, "[UNK]")
+
+        return characters
+
+    def _init(self) -> None:
+        _file = open(self.config_file, encoding="utf-8")
+        _file_path = os.path.dirname(self.config_file)
+        json_content = json.loads(_file.read())
+
+        self._input_width = json_content["input_width"]
+        self._input_height = json_content["input_height"]
+        self._architecture = json_content["architecture"]
+        self._time_steps = json_content["time_steps"]
+        self._characters = self.get_model_characters(json_content["charset"])
+
+        if self._architecture == "easter2b":
+            print(f"Loading Easter2b")
+            model = Easter2b(
+                input_width=self._input_width,
+                input_height=self._input_height,
+                classes=len(self._characters),
+            )
+        else:
+            print(f"Loading Easter2")
+            model = Easter2(
+                input_width=self._input_width,
+                input_height=self._input_height,
+                classes=len(self._characters),
+            )
+
+        weights = json_content["h5"]
+        model.load_weights(f"{_file_path}/{weights}")
+        self._model = Model(
+            model.get_layer("images").input, model.get_layer("Final").output
+        )
+
+    def run(
+        self, line_images: list, replace_blank: str = "", wylie_output: bool = False
+    ):
+        line_batch = [
+            prepare_tf_ocr_image(
+                x, target_width=self._input_width, target_height=self._input_height
+            )
+            for x in line_images
+        ]
+
+        line_batch = np.array(line_batch)
+        print(line_batch.shape[-1])
+
+        if line_batch.shape[-1] == 3:
+            line_batch = line_batch[:, :, :, 0]
+
+        print(line_batch.shape)
+        prediction = self._model.predict_on_batch(line_batch)
+
+        predicted_text = []
+
+        for idx in range(prediction.shape[0]):
+            pred_line = prediction[idx, :, :]
+            pred_line = np.expand_dims(pred_line, axis=0)
+
+            out = K.get_value(
+                K.ctc_decode(
+                    pred_line,
+                    input_length=np.ones(pred_line.shape[0]) * pred_line.shape[1],
+                    greedy=True,
+                )[0][0]
+            )[0]
+
+            filtered_out = np.delete(out, np.where(out == -1))
+            filtered_list = filtered_out.tolist()
+            decoded = "".join(self._characters[x] for x in filtered_list)
+            decoded = decoded.replace("§", " ")
+
+            if not wylie_output:
+                decoded = self._converter.toUnicode(decoded)
+
+            predicted_text.append(decoded)
+
+        return predicted_text
+
+
 class IIIFDownloader:
     def __init__(self, output_dir: str) -> None:
         self._output_dir = output_dir
@@ -240,7 +645,13 @@ class IIIFDownloader:
         response = requests.get(link)
         return response.json()
 
-    def download_data(self, manifest_data: str, work_id: str, file_limit: int = 20, last_pages: bool = True):
+    def download_data(
+        self,
+        manifest_data: str,
+        work_id: str,
+        file_limit: int = 20,
+        last_pages: bool = True,
+    ):
         if "sequences" in manifest_data:
             seq = manifest_data["sequences"]
             volume_id = seq[0]["@id"].split("bdr:")[1].split("/")[0]
@@ -274,7 +685,7 @@ class IIIFDownloader:
 
                 # download also the last images within the range of the specified file-limit
                 if last_pages:
-                    for idx in tqdm(range(max_images-file_limit, max_images)):
+                    for idx in tqdm(range(max_images - file_limit, max_images)):
                         if "images" in seq[0]["canvases"][idx]:
                             img_url = seq[0]["canvases"][idx]["images"][0]["resource"][
                                 "@id"
@@ -288,8 +699,6 @@ class IIIFDownloader:
                                 if res.status_code == 200:
                                     with open(out_file, "wb") as f:
                                         shutil.copyfileobj(res.raw, f)
-                
-
 
     def download(self, manifest_link: str, file_limit: int = 50):
         file_limit = int(file_limit)
