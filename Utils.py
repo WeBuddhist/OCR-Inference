@@ -1,6 +1,9 @@
+import re
 import os
+import json
 import cv2
 import math
+import random
 import logging
 import tensorflow as tf
 import numpy as np
@@ -13,13 +16,27 @@ from DataClasses import Bbox, LineData, LayoutData
 
 
 
-def get_file_name(x) -> str:
-    return os.path.basename(x).split(".")[0]
+def get_file_name(file_path: str) -> str:
+    return os.path.basename(file_path).split(".")[0]
 
 
-def read_label(gt_file: str) -> str:
-    f = open(gt_file, "r", encoding="utf-8")
+def read_label(file_path: str) -> str:
+    f = open(file_path, "r", encoding="utf-8")
     return f.readline()
+
+
+def get_json(file_path: str):
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.read()
+        json_content = json.loads(lines)
+
+    return json_content
+
+def read_lines_from_file(file_path: str) -> list[str]:
+    with open (file_path, "r", encoding="utf-8") as f:
+        content = f.readlines()
+    
+    return content
 
 
 def create_dir(dir_name: str) -> None:
@@ -73,6 +90,14 @@ def resize_image(
     return resized_img, resize_factor
 
 
+def get_random_color():
+    rand_r = random.randint(40, 255)
+    rand_g = random.randint(40, 200)
+    rand_b = random.randint(40, 220)
+    color = (rand_r, rand_g, rand_b)
+
+    return color
+
 def pad_image(img: np.array, patch_size: int = 64, 
               is_mask=False, pad_value: int = 255) -> tuple[np.array, tuple[int, int]]:
     
@@ -125,7 +150,7 @@ def binarize_line(img: np.array, adaptive: bool = True) -> np.array:
     else:
         _, bw = cv2.threshold(line_img, 120, 255, cv2.THRESH_BINARY)
 
-    bw = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    bw = cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
     return bw
 
 
@@ -252,6 +277,16 @@ def unpatch_prediction(prediction: np.array, y_splits: int) -> np.array:
     return prediction_sliced
 
 
+def rotate_from_angle(image: np.array, angle: float) -> np.array:
+    rows, cols = image.shape[:2]
+    rot_matrix = cv2.getRotationMatrix2D((cols / 2, rows / 2), angle, 1)
+
+    rotated_img = cv2.warpAffine(
+        image, rot_matrix, (cols, rows), borderValue=(0, 0, 0)
+    )
+
+    return rotated_img
+
 def rotate_page(
     original_image: np.array,
     line_mask: np.array,
@@ -317,7 +352,7 @@ def rotate_from_hough(image: np.array) -> tuple[np.array, float]:
 
         return image, 0
     
-    prev_img = image.copy()
+    #prev_img = image.copy()
     angles = []
     zero_angles = []
 
@@ -331,7 +366,7 @@ def rotate_from_hough(image: np.array) -> tuple[np.array, float]:
         elif int(angle) == 0:
             zero_angles.append(angle)
 
-        cv2.line(prev_img, (x1, y1), (x2, y2), (100, 100, 0), 3)
+        #cv2.line(prev_img, (x1, y1), (x2, y2), (100, 100, 0), 3)
 
     if len(angles) != 0:     
         avg_angle = statistics.median(angles)
@@ -434,11 +469,36 @@ def get_line_images(
 
     return line_images
 
+def calculate_dilate_iterations(line: LineData, kernel: int):
+    bbox_height = line.bbox.h
+
+    if bbox_height <= 30:
+        dilate_iterations = kernel // 2
+    elif bbox_height > 30 and bbox_height < 50:
+        dilate_iterations = kernel * 1
+    elif bbox_height >= 50 and bbox_height < 90:
+        dilate_iterations = kernel * 2
+    elif bbox_height > 90:
+        dilate_iterations = (
+            kernel * 6
+        )  # maybe go with 4-5? kernel sizes can go up to 126
+    else:
+        print(
+            f"Fallback on kernel calculation, height: {bbox_height}: dilate_kernel = {kernel}, iterations: {dilate_iterations}"
+        )
+        dilate_iterations = 1
+    # print(f"BBox Height: {height} => dilate iterations: {dilate_iterations}")
+
+
+    return dilate_iterations
+
 def get_line_images_from_line_data(
     image: np.array,
     line_data: list[LineData],
     dilate_kernel: int = 24,
+    dilate_iterations: int = 1,
     binarize: bool = False,
+    calculate_iterations: bool = True
 ):
     line_images = []
 
@@ -446,31 +506,14 @@ def get_line_images_from_line_data(
     if dilate_kernel == 0:
         dilate_kernel = 24
 
-    dilate_iterations = 1
 
     for line in line_data:
         image_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
         cv2.drawContours(
             image_mask, [line.contour], contourIdx=0, color=(255, 255, 255), thickness=-1
         )
-
-        bbox_height = line.bbox.h
-
-        if bbox_height <= 30:
-            dilate_iterations = dilate_kernel // 2
-        elif bbox_height > 30 and bbox_height < 50:
-            dilate_iterations = dilate_kernel * 1
-        elif bbox_height >= 50 and bbox_height < 90:
-            dilate_iterations = dilate_kernel * 2
-        elif bbox_height > 90:
-            dilate_iterations = (
-                dilate_kernel * 6
-            )  # maybe go with 4-5? kernel sizes can go up to 126
-        else:
-            print(
-                f"Fallback on kernel calculation, height: {bbox_height}: dilate_kernel = {dilate_kernel}, iterations: {dilate_iterations}"
-            )
-        # print(f"BBox Height: {height} => dilate iterations: {dilate_iterations}")
+        if calculate_iterations:
+            dilate_iterations = calculate_dilate_iterations(line, dilate_kernel)
 
         dilated1 = cv2.dilate(
             image_mask,
@@ -592,11 +635,12 @@ def get_line_treshold(line_prediction: np.array, slice_width: int = 20, steps: i
         
     
     line_threshold = np.median(y_points) // n_contours
-    #print(f"line_treshold: {line_threshold}")
+    print(f"line_treshold: {line_threshold}")
 
     return line_threshold
 
 def get_line_bbox_centers(layout_data: LayoutData) -> list[tuple[int, int]]:
+    # TODO: change input to a list of LineData, so that this function can also run within the line detection-only workflow
     centers = []
 
     for line in layout_data.lines:
@@ -830,7 +874,7 @@ def optimize_countour(cnt, e=0.001):
 
 
 def prepare_ocr_image(
-    line_image: np.array, target_width: int = 2000, target_height: int = 80
+line_image: np.array, target_width: int = 2000, target_height: int = 80
 ):
     if len(line_image.shape) > 2:
         line_image = cv2.cvtColor(line_image, cv2.COLOR_BGR2GRAY)
@@ -843,7 +887,8 @@ def prepare_ocr_image(
     )
 
     image = image.reshape((1, target_height, target_width))
-    image = (image / 127.5) - 1.0
+    #image = (image / 127.5) - 1.0
+    iamge = image / 255.0
     image = image.astype(np.float32)
     return image
 
@@ -891,6 +936,25 @@ def get_text_line_block(coordinate, index, unicode_text):
     unicode_field.text = unicode_text
 
     return text_line
+
+
+def process_wylie_label(label: str) -> str:
+    label = label.replace("\\u0f85", "&")
+    label = label.replace("\\u0f09", "ä")
+    label = label.replace("\\u0f13", "ö")
+    label = label.replace("\\u0f12", "ü")
+    label = label.replace("\\u0fd3", "@")
+    label = label.replace("\\u0fd4", "#")
+    label = label.replace("\\u0f00", "oM")
+    label = label.replace("\\u0f7f", "}")
+    label = label.replace("*", " ")
+    label = label.replace("  ", " ")
+    label = label.replace("_", "")
+    label = label.replace(" ", "§") # specific encoding for the tsheg
+
+    label = re.sub("[\[(].*?[\])]", "", label)
+
+    return label
 
 
 def build_xml_document(

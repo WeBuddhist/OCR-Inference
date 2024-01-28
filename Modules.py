@@ -26,6 +26,7 @@ from Utils import (
     binarize_line,
     resize_to_width,
     rotate_from_hough,
+    back_rotate_lines,
     get_line_bbox_centers,
     get_line_treshold,
     group_bbox_centers,
@@ -107,7 +108,7 @@ class PatchedPerigLayoutDetection:
         return back_sized_image, combined_output
 
     def generate_page_data(
-        self, predictions: np.array, area_threshold: int = 20
+        self, predictions: np.array, angle: float, area_threshold: int = 20, filter_for_border: bool = True
     ) -> np.array:
         # TODO: move the calculation of the text bounding box after the filtering of the lines so that small outlier contours don't extend the box too much
         # TODO: add filtering for the other classes
@@ -136,6 +137,8 @@ class PatchedPerigLayoutDetection:
 
         prediction_images = {}
 
+        prediction_height, prediction_width = predictions.shape[:2]
+
         if np.sum(pred_lines) > 0:
             x, y, w, h = cv2.boundingRect(np.array(pred_lines))
             bbox = Bbox(x, y, w, h)
@@ -163,6 +166,15 @@ class PatchedPerigLayoutDetection:
                 x_center = x + (w // 2)
                 y_center = y + (h // 2)
 
+                # filter contours that touch the image border
+                if filter_for_border:
+                    
+                    if x == 0 or y == 0 :
+                        continue
+
+                if x+w == prediction_width or y+h == prediction_height:
+                    continue
+
                 line_data = LineData(
                     contour=contour, bbox=Bbox(x, y, w, h), center=(x_center, y_center)
                 )
@@ -178,12 +190,13 @@ class PatchedPerigLayoutDetection:
                 pred_images, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
             )
 
+            
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 bbox = Bbox(x, y, w, h)
                 images.append(bbox)
 
-            prediction_images["images"] = pred_lines
+            prediction_images["images"] = pred_lines # TODO -> why pred_lines=!?
         else:
             prediction_images["images"] = None
 
@@ -215,7 +228,7 @@ class PatchedPerigLayoutDetection:
         else:
             prediction_images["captions"] = None
 
-        layout_data = LayoutData(
+        layout_data = LayoutData(angle,
             images, text_bboxes, lines, captions, margins, predictions=prediction_images
         )
 
@@ -279,10 +292,18 @@ class PatchedPerigLayoutDetection:
 
         return preview_image
 
-    def sort_lines(self, layout_data: LayoutData):
+    def sort_lines(self, layout_data: LayoutData, threshold: int = 20, calculate: bool = True):
+        # TODO: change input to a list of LineData, so that this function can also run within the line detection-only workflow
+        # So return here only the list of LineData and update the layout data outside of this function, maybe keeping the unmerged lines stored temporarily
         if len(layout_data.lines) > 0:
             bbox_centers = get_line_bbox_centers(layout_data)
-            line_treshold = get_line_treshold(layout_data.predictions["lines"])
+            
+            if calculate:
+
+                line_treshold = get_line_treshold(layout_data.predictions["lines"])
+            else:
+                line_treshold = threshold
+            
             sorted_bbox_centers = group_bbox_centers(
                 bbox_centers, line_threshold=line_treshold
             )
@@ -297,9 +318,7 @@ class PatchedPerigLayoutDetection:
 
         return layout_data
 
-    def predict(
-        self, image: np.array, sort_lines: bool = True, return_preview: bool = False
-    ):
+    def predict(self, image: np.array, area_threshold: int = 20):
         p_img = resize_to_width(image, target_width=2048)
 
         p_img = cv2.cvtColor(p_img, cv2.COLOR_BGR2RGB)
@@ -311,7 +330,7 @@ class PatchedPerigLayoutDetection:
         p_img = cv2.resize(p_img, (image.shape[1], image.shape[0]))
 
         _prediction = _prediction.astype(np.uint8)
-        layout_data = self.generate_page_data(_prediction, area_threshold=20)
+        layout_data = self.generate_page_data(_prediction, angle, area_threshold=area_threshold)
         self.current_layout_data = layout_data
 
         preview_img = self.generate_preview(p_img, layout_data)
@@ -434,10 +453,12 @@ class PatchedLineDetection:
         ) = generate_line_images(
             original_image, back_sized_image, line_kernel, self._binarize_output
         )
+        if len(sorted_contours) > 0:
+            sorted_contours = back_rotate_lines(original_image, sorted_contours, angle)
         return back_sized_image, rotated_img, line_images, sorted_contours, bbox, peaks
 
 
-class OCRInference:
+class OnnxInference:
     def __init__(self, config_file, mode: str = "cpu") -> None:
         self.config = config_file
         self._onnx_model_file = None
@@ -450,13 +471,10 @@ class OCRInference:
         self._init()
 
     def _init(self) -> None:
+        _model_dir = os.path.dirname(self.config)
         _file = open(self.config, encoding="utf-8")
         json_content = json.loads(_file.read())
-
-        if self.mode == "cuda":
-            self._onnx_model_file = json_content["gpu-model"]
-        else:
-            self._onnx_model_file = json_content["cpu-model"]
+        self._onnx_model_file = f"{_model_dir}/{json_content['onnx-model']}"
 
         self._input_width = json_content["input_width"]
         self._input_height = json_content["input_height"]
@@ -466,7 +484,7 @@ class OCRInference:
             True if json_content["squeeze_channel_dim"] == "yes" else False
         )
         self._swap_hw = True if json_content["swap_hw"] == "yes" else False
-        self._characters = json_content["charset"]
+        self._characters = self.get_charset(json_content["charset"])
 
         if self.mode == "cuda":
             execution_providers = ["CUDAExecutionProvider"]
@@ -476,19 +494,14 @@ class OCRInference:
             self._onnx_model_file, providers=execution_providers
         )
 
+    def get_charset(self, charset: str) -> str:
+        return f"ß{charset} "
+
         # print(f"Squeezing channel dim: {self._squeeze_channel_dim}")
 
-    def run(self, line_images: list, replace_blank: str = ""):
-        line_tresh = 10  # temporary value, TODO: turn into width and height check
-        line_images = [x for x in line_images if x.shape[0] > line_tresh]
+    def run(self, line_images: list, replace_tsheg: str = "", convert_to_unicode: bool = False):
 
-        img_batch = [
-            prepare_ocr_image(
-                x, target_width=self._input_width, target_height=self._input_height
-            )
-            for x in line_images
-        ]
-        img_batch = np.array(img_batch, np.float32)
+        img_batch = np.array(line_images, np.float32)
 
         if self._squeeze_channel_dim:
             img_batch = np.squeeze(img_batch, axis=1)
@@ -516,7 +529,8 @@ class OCRInference:
             text, _ = viterbi_search(pred_line, self._characters)
 
             if len(text) > 0:
-                text = text.replace("§", replace_blank)
+                text = text.replace(" ", "")
+                text = text.replace("§", replace_tsheg)
                 predicted_text.append(text)
             else:
                 predicted_text.append("")
@@ -585,23 +599,18 @@ class KerasInference:
         )
 
     def run(
-        self, line_images: list, replace_blank: str = "", wylie_output: bool = False
+        self, line_images: np.array, replace_blank: str = "", wylie_output: bool = False
     ):
-        line_batch = [
-            prepare_tf_ocr_image(
-                x, target_width=self._input_width, target_height=self._input_height
-            )
-            for x in line_images
-        ]
-
-        line_batch = np.array(line_batch)
-        print(line_batch.shape[-1])
+        ### todo: make sure each image in line_images has the correct shape 
+    
+        line_batch = np.array(line_images)
+        #print(line_batch.shape[-1])
 
         if line_batch.shape[-1] == 3:
             line_batch = line_batch[:, :, :, 0]
 
         print(line_batch.shape)
-        prediction = self._model.predict_on_batch(line_batch)
+        prediction = self._model.predict_on_batch(line_images)
 
         predicted_text = []
 
@@ -613,7 +622,7 @@ class KerasInference:
                 K.ctc_decode(
                     pred_line,
                     input_length=np.ones(pred_line.shape[0]) * pred_line.shape[1],
-                    greedy=True,
+                    greedy=False, beam_width=10
                 )[0][0]
             )[0]
 

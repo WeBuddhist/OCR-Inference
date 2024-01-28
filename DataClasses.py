@@ -23,9 +23,17 @@ class PerigPrediction:
 
 @dataclass
 class LayoutData:
+    rotation: float
     images: list[Bbox]
     text_bboxes: list[Bbox]
     lines: list[LineData]
     captions: list[Bbox]
     margins: list[Bbox]
     predictions: dict
+
+
+@dataclass
+class PageLines:
+    rotation: float
+    lines: list[LineData]
+    bbox: Bbox
