@@ -499,7 +499,7 @@ class OnnxInference:
 
         # print(f"Squeezing channel dim: {self._squeeze_channel_dim}")
 
-    def run(self, line_images: list, replace_tsheg: str = "", convert_to_unicode: bool = False):
+    def run(self, line_images: np.array, replace_tsheg: str = "", convert_to_unicode: bool = False):
 
         img_batch = np.array(line_images, np.float32)
 
@@ -574,6 +574,8 @@ class KerasInference:
         self._input_width = json_content["input_width"]
         self._input_height = json_content["input_height"]
         self._architecture = json_content["architecture"]
+        self._input_layer = json_content["input_layer"]
+        self._output_layer = json_content["output_layer"]
         self._time_steps = json_content["time_steps"]
         self._characters = self.get_model_characters(json_content["charset"])
 
@@ -595,7 +597,7 @@ class KerasInference:
         weights = json_content["h5"]
         model.load_weights(f"{_file_path}/{weights}")
         self._model = Model(
-            model.get_layer("images").input, model.get_layer("Final").output
+            model.get_layer(self._input_layer).input, model.get_layer(self._output_layer).output
         )
 
     def run(

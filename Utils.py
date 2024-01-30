@@ -957,6 +957,50 @@ def process_wylie_label(label: str) -> str:
     return label
 
 
+
+def prepare_ocr_image2(
+    line_image: np.array, target_width: int = 2000, target_height: int = 80
+    ):
+        if len(line_image.shape) > 2:
+            line_image = cv2.cvtColor(line_image, cv2.COLOR_BGR2GRAY)
+
+        image = pad_image2(
+            line_image,
+            target_width=target_width,
+            target_height=target_height,
+            padding="black",
+        )
+        
+        image = image.reshape((1, target_height, target_width))
+
+        #image = (image / 127.5) - 1.0
+        image = image / 255.0
+        image = image.astype(np.float32)
+        return image
+
+
+def adaptive_binarize(image: np.array, block_size: int = 13, c: float = 11, invert: bool = False):
+    c = round(c, 2)
+    
+    bw = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, c)
+
+    if invert:
+        bw = cv2.bitwise_not(bw)
+
+    return bw
+
+def tweak_image(line_img: np.array):
+    line_img = cv2.cvtColor(line_img, cv2.COLOR_RGB2GRAY)
+    #line_img = cv2.GaussianBlur(line_img, (3, 3), 0)
+    line_img = cv2.erode(line_img, kernel=(3, 3), iterations=1)
+    line_img = adaptive_binarize(line_img)
+
+    line_img = cv2.cvtColor(line_img, cv2.COLOR_GRAY2RGB)
+    return line_img
+
+
+
+# old xml export
 def build_xml_document(
     image: np.array,
     image_name: str,
@@ -964,6 +1008,7 @@ def build_xml_document(
     coordinates: list,
     text_lines: list,
 ):
+    logging.warn("This function will be deprecated soon, don't use it anymore.")
     root = etree.Element("PcGts")
     root.attrib[
         "xmlns"
