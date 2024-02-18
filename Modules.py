@@ -39,16 +39,50 @@ from DataClasses import Bbox, LineData, LayoutData
 # from keras.models import Model
 
 
+class classModernLayoutDetection:
+        
+        def __init__(self, config_file: str):
+            self.config_file = config_file
+            self.patch_size = 512
+            self.execution_providers = ["CPUExecutionProvider", "CUDAExecutionProvider"]
+            self.inference_session = None
+
+            self.init(self.config_file)
+
+
+        def init(self, config_file: str):
+            if not os.path.isfile(config_file):
+                logging.error(f"{config_file} does not exist, exiting.")
+            else:
+                try:
+                    model_dir = os.path.dirname(config_file)
+                    _file = open(config_file)
+                    json_content = json.loads(_file.read())
+                    self.patch_size = int(json_content["input_width"])
+                    onnx_model_file = json_content["model"]
+                    self.class_dict = json_content["classes"]
+                    model_file_path = f"{model_dir}/{onnx_model_file}"
+                    self.inference_session = ort.InferenceSession(
+                        model_file_path, providers=self.execution_providers
+                    )
+
+                    logging.info(f"Loaded model from: {onnx_model_file}")
+                
+                except BaseException as e:
+                    logging.error(f"Failed to initialize Layout Detection: {e}")
+
+
 class PatchedPerigLayoutDetection:
     """
     Layout Detection specifically optimized for the traditional 'long' Tibetan book format 'perig'.
     The inference runs on the provided onnx model file.
     """
 
-    def __init__(self, config_file: str) -> None:
+    def __init__(self, config_file: str, mode: str = "cuda") -> None:
         self.config_file = config_file
         self.patch_size = 512
-        self.execution_providers = ["CPUExecutionProvider", "CUDAExecutionProvider"]
+        self.mode = mode
+        self.execution_providers = None
         self.layout_inference = None
         self.class_dict = {}
 
@@ -69,6 +103,14 @@ class PatchedPerigLayoutDetection:
                 onnx_model_file = json_content["model"]
                 self.class_dict = json_content["classes"]
                 model_file_path = f"{model_dir}/{onnx_model_file}"
+
+                if self.mode == "cuda":
+                    execution_providers = ["CUDAExecutionProvider"]
+                else:
+                    execution_providers = ["CPUExecutionProvider"]
+
+                self.execution_providers = execution_providers
+
                 self.layout_inference = ort.InferenceSession(
                     model_file_path, providers=self.execution_providers
                 )
@@ -292,14 +334,13 @@ class PatchedPerigLayoutDetection:
 
         return preview_image
 
-    def sort_lines(self, layout_data: LayoutData, threshold: int = 20, calculate: bool = True):
+    def sort_lines(self, layout_data: LayoutData, threshold: int = 20, calculate: bool = True, group_lines: bool = False):
         # TODO: change input to a list of LineData, so that this function can also run within the line detection-only workflow
         # So return here only the list of LineData and update the layout data outside of this function, maybe keeping the unmerged lines stored temporarily
         if len(layout_data.lines) > 0:
             bbox_centers = get_line_bbox_centers(layout_data)
             
             if calculate:
-
                 line_treshold = get_line_treshold(layout_data.predictions["lines"])
             else:
                 line_treshold = threshold
@@ -307,8 +348,9 @@ class PatchedPerigLayoutDetection:
             sorted_bbox_centers = group_bbox_centers(
                 bbox_centers, line_threshold=line_treshold
             )
-            new_lines = group_line_chunks(sorted_bbox_centers, layout_data)
-            layout_data.lines = new_lines
+            if group_lines:
+                new_lines = group_line_chunks(sorted_bbox_centers, layout_data)
+                layout_data.lines = new_lines
             self.current_layout_data = layout_data
             return layout_data
         else:
@@ -453,13 +495,13 @@ class PatchedLineDetection:
         ) = generate_line_images(
             original_image, back_sized_image, line_kernel, self._binarize_output
         )
-        if len(sorted_contours) > 0:
+        if sorted_contours is not None and len(sorted_contours) > 0:
             sorted_contours = back_rotate_lines(original_image, sorted_contours, angle)
         return back_sized_image, rotated_img, line_images, sorted_contours, bbox, peaks
 
 
 class OnnxInference:
-    def __init__(self, config_file, mode: str = "cpu") -> None:
+    def __init__(self, config_file, mode: str = "cuda") -> None:
         self.config = config_file
         self._onnx_model_file = None
         self._input_width = 2000

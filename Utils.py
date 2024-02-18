@@ -8,10 +8,13 @@ import logging
 import tensorflow as tf
 import numpy as np
 import statistics
+import matplotlib.pyplot as plt
+import xml.etree.ElementTree as etree
+
 from datetime import datetime
 from xml.dom import minidom
 from scipy.signal import find_peaks
-import xml.etree.ElementTree as etree
+
 from DataClasses import Bbox, LineData, LayoutData
 
 
@@ -42,6 +45,22 @@ def read_lines_from_file(file_path: str) -> list[str]:
 def create_dir(dir_name: str) -> None:
     if not os.path.exists(dir_name):
         os.makedirs(dir_name)
+
+
+def show_image(image: np.array, cmap: str = "", axis="off") -> None:
+    plt.figure(figsize=(24, 13))
+    plt.axis(axis)
+    
+    if cmap != "":
+        plt.imshow(image, cmap=cmap)
+    else:
+        plt.imshow(image)
+
+def show_overlay(image: np.array, mask: np.array, alpha=0.4, axis="off"):
+    plt.figure(figsize=(24, 13))
+    plt.axis(axis)
+    plt.imshow(image)
+    plt.imshow(mask, alpha=alpha)
 
 
 def batch_data(images: list[str], batch_size: int = 8) -> list[str]:
@@ -139,12 +158,12 @@ def resize_to_width(image, target_width: int):
     return image
 
 
-def binarize_line(img: np.array, adaptive: bool = True) -> np.array:
+def binarize_line(img: np.array, adaptive: bool = True, block_size: int = 11, c: int = 13) -> np.array:
     line_img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
     if adaptive:
         bw = cv2.adaptiveThreshold(
-            line_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 13
+            line_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, c
         )
 
     else:
@@ -287,6 +306,17 @@ def rotate_from_angle(image: np.array, angle: float) -> np.array:
 
     return rotated_img
 
+
+def rotate_from_angle_around_center(image: np.array, angle: float, center: tuple[int, int]) -> np.array:
+    rows, cols = image.shape[:2]    
+    rot_matrix = cv2.getRotationMatrix2D(center, angle, 1)
+    rotated_img = cv2.warpAffine(
+        image, rot_matrix, (cols, rows), borderValue=(0, 0, 0)
+    )
+
+    return rotated_img
+
+
 def rotate_page(
     original_image: np.array,
     line_mask: np.array,
@@ -313,10 +343,8 @@ def rotate_page(
         mean_angle = -(90 - np.mean(high_angles))
 
     else:
-        # print(f"Defaulting to 0: {angles}")
         mean_angle = 0
 
-    # print(f"Rotation angle: {mean_angle}")
 
     rows, cols = original_image.shape[:2]
     rot_matrix = cv2.getRotationMatrix2D((cols / 2, rows / 2), mean_angle, 1)
@@ -387,6 +415,158 @@ def rotate_from_hough(image: np.array) -> tuple[np.array, float]:
     rotated_img = cv2.warpAffine(image, rot_matrix, (cols, rows), borderValue=(0, 0, 0))
 
     return rotated_img, rot_angle
+
+def get_line_image_from_bbox(image: np.array, line: LineData, x_offset: int = 15, y_offset: float = 0.7):    
+    image_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+    min_rect = cv2.minAreaRect(line.contour)
+    center, width_height, angle = min_rect
+
+    w, h = width_height
+    if angle > 87 and w < h:
+        angle = (90 -angle)
+
+        min_rect = (center, (h, w), angle)
+    else:
+        angle = -angle
+        
+    box = cv2.boxPoints(min_rect)
+    box = np.intp(box)
+    box = np.expand_dims(box, axis=1)
+    rotated_box = rotate_contour(box, center, angle)
+    more_rot_img = rotate_from_angle_around_center(image, angle, center=(int(center[0]), int(center[1])))
+    rotated_b_rect = cv2.boundingRect(rotated_box)
+    x, y, w, h = rotated_b_rect
+    y_off = int(h * y_offset)
+    x_off = x_offset
+
+    cv2.rectangle(
+                image_mask,
+                (x-x_off, y-y_off),
+                (x + w + x_off, y + h + y_off),
+                (255, 255, 255),
+                -1,
+            )
+    
+    image_masked = cv2.bitwise_and(more_rot_img, more_rot_img, mask=image_mask)
+    image_masked = np.delete(image_masked, np.where(~image_masked.any(axis=1))[0], axis=0)
+    image_masked = np.delete(image_masked, np.where(~image_masked.any(axis=0))[0], axis=1)
+
+    return image_masked
+
+
+def get_kernel_line(
+    image: np.array,
+    line: LineData,
+    dilate_kernel: int = 24, # TODO: dynamic kernel calculation..
+    dilate_iterations: int = 1,
+    binarize: bool = False,
+    calculate_iterations: bool = True
+):
+    # enforce a default value in case the somebody passes 0 as value
+    if dilate_kernel == 0:
+        dilate_kernel = 24
+   
+    image_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+    _, _, angle = cv2.minAreaRect(line.contour)
+
+
+    cv2.drawContours(
+        image_mask, [line.contour], contourIdx=0, color=(255, 255, 255), thickness=-1
+    )
+
+    if angle > 87:
+        angle = angle - 90
+    
+    image_mask = rotate_from_angle(image_mask, angle)
+    image = rotate_from_angle(image, angle)
+
+    # kernel iteration calculation based on the actual contour by using multiple slices of the contour instead of the bbox since the bbox can be too large in case of bended lines
+
+    dilate_iterations = 1
+
+    slice_width = 20
+    steps = 8
+    x, y, w, h = cv2.boundingRect(image_mask)
+    bbox_width = w - x
+    x_steps = (bbox_width // steps) - 1 - slice_width
+
+    slices = []
+    heights = []
+
+    for step in range(1, steps+1):
+        x_offset = x_steps * step
+        x_start = x+x_offset
+        x_end = x_start+slice_width
+
+        slice = image_mask[y:y+h, x_start:x_end]
+        slices.append(slice)
+
+        contours, _ = cv2.findContours(slice, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if len(contours) > 0:
+            x, y, w, h = cv2.boundingRect(contours[0]) # or use the max contour here?
+            heights.append(h)
+
+    mean_height = np.mean(heights)
+    #print(f"mean height: {mean_height}")
+
+    if mean_height <= 10:
+        dilate_iterations = int(dilate_kernel // 1.5)
+    elif mean_height > 10 and mean_height < 30:
+        dilate_iterations = int(dilate_kernel * 0.8)
+    elif mean_height >= 30 and mean_height < 50:
+        dilate_iterations = dilate_kernel * 2
+    elif mean_height > 50:
+        dilate_iterations = (
+            dilate_kernel * 6
+        )  # maybe go with 4-5? kernel sizes can go up to 126
+    else:
+        #print(f"Fallback on kernel calculation, height: {mean_height}: dilate_kernel = {dilate_kernel}, iterations: {dilate_iterations}")
+        dilate_iterations = 1
+
+    #print(f"Calculated kernel iterations: {dilate_iterations}")
+
+    """
+    old calcuation using the bbox of the line
+
+    if calculate_iterations:
+        dilate_iterations = calculate_dilate_iterations(line, dilate_kernel)
+    """
+
+    dilated1 = cv2.dilate(
+        image_mask,
+        kernel=(dilate_kernel, dilate_kernel),
+        iterations=dilate_iterations,
+        borderValue=0,
+        anchor=(-1, 0),
+        borderType=cv2.BORDER_DEFAULT,
+    )
+    dilated2 = cv2.dilate(
+        image_mask,
+        kernel=(dilate_kernel, dilate_kernel),
+        iterations=dilate_iterations,
+        borderValue=0,
+        anchor=(0, 1),
+        borderType=cv2.BORDER_DEFAULT,
+    )
+    combined = cv2.add(dilated1, dilated2)
+    image_masked = cv2.bitwise_and(image, image, mask=combined)
+
+    cropped_img = np.delete(image_masked, np.where(~image_masked.any(axis=1))[0], axis=0)
+    cropped_img = np.delete(cropped_img, np.where(~cropped_img.any(axis=0))[0], axis=1)
+    #cropped_img = cv2.dilate(cropped_img, kernel=(1, 8), iterations=2)
+    
+    if binarize:
+        # indices = np.where(cropped_img[:, :, 1] == 0)
+        # clear = cropped_img.copy()
+        # clear[indices[0], indices[1], :] = [255, 255, 255]
+        # clear_bw = cv2.cvtColor(clear, cv2.COLOR_BGR2GRAY)
+        # _, thresh = cv2.threshold(clear_bw, 170, 255, cv2.THRESH_BINARY)
+        # line_images.append(thresh)
+        cropped_img = binarize_line(cropped_img)
+    
+    return cropped_img, combined, image_mask
+
 
 
 def get_line_images(
@@ -495,7 +675,7 @@ def calculate_dilate_iterations(line: LineData, kernel: int):
 def get_line_images_from_line_data(
     image: np.array,
     line_data: list[LineData],
-    dilate_kernel: int = 24,
+    dilate_kernel: int = 24, # TODO: dynamic kernel calculation..
     dilate_iterations: int = 1,
     binarize: bool = False,
     calculate_iterations: bool = True
@@ -517,7 +697,7 @@ def get_line_images_from_line_data(
 
         dilated1 = cv2.dilate(
             image_mask,
-            kernel=(dilate_kernel, dilate_kernel),
+            kernel=(int(1.5*dilate_kernel), dilate_kernel),
             iterations=dilate_iterations,
             borderValue=0,
             anchor=(-1, 0),
@@ -525,7 +705,7 @@ def get_line_images_from_line_data(
         )
         dilated2 = cv2.dilate(
             image_mask,
-            kernel=(dilate_kernel, dilate_kernel),
+            kernel=(int(1.5*dilate_kernel), dilate_kernel),
             iterations=dilate_iterations,
             borderValue=0,
             anchor=(0, 1),
@@ -566,7 +746,17 @@ def group_bbox_centers(bbox_centers: list[tuple[int, int]], line_threshold: int 
   for i in range(0, len(bbox_centers)):    
       if len(tmp_line) > 0:
         for s in range(0, len(tmp_line)):
-          y_diff = abs(tmp_line[s][1] - bbox_centers[i][1])
+          ys = [y[1] for y in tmp_line]
+          mean_y = np.mean(ys)
+
+          #y_diff = abs(tmp_line[s][1] - bbox_centers[i][1])
+          """
+          I use the mean of the hitertho present line chunks in tmp_line since
+          the precalculated fixed threshold can break the sorting if
+          there is some slight bending in the line. This part may need some tweaking after
+          some further practical review
+          """
+          y_diff = abs(mean_y - bbox_centers[i][1])
 
           if y_diff > line_threshold:
             tmp_line.sort(key=lambda x:x[0])
@@ -635,7 +825,6 @@ def get_line_treshold(line_prediction: np.array, slice_width: int = 20, steps: i
         
     
     line_threshold = np.median(y_points) // n_contours
-    print(f"line_treshold: {line_threshold}")
 
     return line_threshold
 
@@ -767,7 +956,6 @@ def group_line_chunks(sorted_bbox_centers, layout_data: LayoutData, debug: bool 
           for box_center in bbox_centers:
             for line_data in layout_data.lines:
               if box_center == line_data.center:
-                  #print("Found yah! Chunk ;)")
                   contour_stack.append(line_data.contour)
                   break
         
@@ -802,6 +990,27 @@ def group_line_chunks(sorted_bbox_centers, layout_data: LayoutData, debug: bool 
     return new_line_data
 
 
+def generate_line_image(image, contour, kernel: tuple = (10, 14), iterations: int = 4):
+    image_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+    cv2.drawContours(image_mask, [contour], contourIdx=-1, color=(255, 255, 255), thickness=-1)
+    dilate_k = np.ones(kernel, dtype=np.uint8)
+    kernel_iterations = iterations
+
+    image_mask = cv2.dilate(image_mask, dilate_k, iterations=kernel_iterations)
+    image_masked = cv2.bitwise_and(image, image, mask=image_mask)
+
+    cropped_img = np.delete(image_masked, np.where(~image_masked.any(axis=1))[0], axis=0)
+    cropped_img = np.delete(cropped_img,np.where(~cropped_img.any(axis=0))[0], axis=1)   
+    #display(Image.fromarray(cropped_img))
+
+    #indices = np.where(cropped_img[:, :]==0)
+    #clear = cropped_img.copy()
+    #clear[indices[0], indices[1]] = [255, 255, 255]
+    #clear_bw = cv2.cvtColor(clear, cv2.COLOR_BGR2GRAY)
+    #_ ,thresh = cv2.threshold(clear_bw, 170, 255,cv2.THRESH_BINARY)
+
+    return cropped_img
+
 
 def generate_line_images(
     image: np.array, prediction: np.array, line_kernel: int, binarize: bool
@@ -809,6 +1018,7 @@ def generate_line_images(
     """
     Applies some rotation correction to the original image and creates the line images based on the predicted lines.
     """
+    logging.warn("This function will be removed soon.")
     rotated_img, rotated_prediction, angle = rotate_page(
         original_image=image, line_mask=prediction
     )
@@ -947,6 +1157,7 @@ def process_wylie_label(label: str) -> str:
     label = label.replace("\\u0fd4", "#")
     label = label.replace("\\u0f00", "oM")
     label = label.replace("\\u0f7f", "}")
+    label = label.replace(":", "aH ")
     label = label.replace("*", " ")
     label = label.replace("  ", " ")
     label = label.replace("_", "")
@@ -1008,7 +1219,7 @@ def build_xml_document(
     coordinates: list,
     text_lines: list,
 ):
-    logging.warn("This function will be deprecated soon, don't use it anymore.")
+    #logging.warn("This function will be deprecated soon, don't use it anymore.")
     root = etree.Element("PcGts")
     root.attrib[
         "xmlns"
